@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lcaa-campus-auth"
+version = "2.0.0"
+description = "Cross-platform eLearning portal auto authentication for the LZU campus network"
+readme = "README.md"
+requires-python = ">=3.8"
+# certifi is the only hard dependency: it gives an old Windows 7 a current CA
+# bundle for the HTTPS probes, and the HTTP login path needs nothing else.
+dependencies = ["certifi>=2023.7.22"]
+
+[project.optional-dependencies]
+win = ["pywin32>=227"]
+macos = ["keyring>=24", "pyobjc-framework-CoreWLAN>=10"]
+linux = ["keyring>=24"]
+browser = ["playwright>=1.40"]
+
+[tool.setuptools]
+package-dir = { "" = "outputs" }
+py-modules = ["campus_auth", "campus_core", "portal_http", "portal_browser", "setup_ui"]
+packages = ["platforms", "platforms.win", "platforms.darwin", "platforms.linux"]
