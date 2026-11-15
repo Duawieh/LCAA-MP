@@ -1,23 +1,26 @@
-"""Native WLAN API: no localized netsh parsing and no access to Wi-Fi keys."""
+"""Native Windows WLAN API: no localized netsh parsing and no access to Wi-Fi keys."""
 import ctypes as c
 from ctypes import wintypes as w
-from dataclasses import dataclass
 import logging
-import time
+from campus_core import CAMPUS, Candidate, choose, pause
 
 log = logging.getLogger('campus')
-CAMPUS = {b'iLZU', b'LZU'}
+
 
 class GUID(c.Structure):
     _fields_ = [('data1', w.DWORD), ('data2', w.WORD), ('data3', w.WORD), ('data4', c.c_ubyte * 8)]
 
+
 class Interface(c.Structure):
     _fields_ = [('guid', GUID), ('description', w.WCHAR * 256), ('state', w.DWORD)]
 
+
 class SSID(c.Structure):
     _fields_ = [('length', w.DWORD), ('data', c.c_ubyte * 32)]
+
     def value(self):
         return bytes(self.data[:min(self.length, 32)])
+
 
 class Network(c.Structure):
     _fields_ = [('profile', w.WCHAR * 256), ('ssid', SSID), ('bss_type', w.DWORD),
@@ -26,31 +29,22 @@ class Network(c.Structure):
                 ('signal', w.DWORD), ('security', w.BOOL), ('auth', w.DWORD),
                 ('cipher', w.DWORD), ('flags', w.DWORD), ('reserved', w.DWORD)]
 
+
 class Connection(c.Structure):
     _fields_ = [('mode', w.DWORD), ('profile', w.LPCWSTR), ('ssid', c.c_void_p),
                 ('bssids', c.c_void_p), ('bss_type', w.DWORD), ('flags', w.DWORD)]
+
 
 class Association(c.Structure):
     _fields_ = [('ssid', SSID), ('bss_type', w.DWORD), ('bssid', c.c_ubyte * 6),
                 ('phy', w.DWORD), ('phy_index', w.DWORD), ('signal', w.DWORD),
                 ('rx', w.DWORD), ('tx', w.DWORD)]
 
+
 class Attributes(c.Structure):
     _fields_ = [('state', w.DWORD), ('mode', w.DWORD), ('profile', w.WCHAR * 256),
                 ('association', Association), ('security', w.DWORD * 4)]
 
-@dataclass(frozen=True)
-class Candidate:
-    ssid: bytes
-    profile: str
-    signal: int
-    connectable: bool = True
-
-def choose(candidates, current):
-    if current is not None and current not in CAMPUS:
-        return None
-    eligible = [n for n in candidates if n.ssid in CAMPUS and n.profile and n.connectable]
-    return max(eligible, key=lambda n: (n.signal, n.ssid == current), default=None)
 
 class Wlan:
     def __init__(self):
@@ -119,26 +113,8 @@ class Wlan:
         params = Connection(0, candidate.profile, None, None, 1, 0)
         self.check(self.dll.WlanConnect(self.handle, c.byref(interface.guid), c.byref(params), None))
 
-def pause(seconds, stopped):
-    until = time.monotonic() + seconds
-    while time.monotonic() < until:
-        if stopped():
-            return False
-        time.sleep(.2)
-    return not stopped()
 
-def campus_wifi_connected():
-    wlan = None
-    try:
-        wlan = Wlan()
-        return any(wlan.current(interface) in CAMPUS for interface in wlan.interfaces())
-    except Exception:
-        return False
-    finally:
-        if wlan:
-            wlan.close()
-
-def ensure_campus_wifi(stopped, online=None):
+def ensure_campus_wifi(stopped):
     """Called only after repeated internet failures; connect saved campus profiles."""
     wlan = None
     try:
@@ -163,13 +139,6 @@ def ensure_campus_wifi(stopped, online=None):
         candidate, interface, current = max(choices, key=lambda x: (x[0].signal, x[0].ssid == x[2]))
         if stopped():
             return False
-        # Scanning can take time; do not disrupt a connection restored meanwhile.
-        if online is not None and online():
-            log.info('WIFI_CONNECT_SKIPPED: internet already restored')
-            return True
-        if wlan.current(interface) not in (None, *CAMPUS):
-            log.info('WIFI_CONNECT_SKIPPED: interface changed to another network')
-            return True
         # Also request connection to the current SSID: handles a stale association.
         log.info('WIFI_CONNECT ssid=%s signal=%s%%', candidate.ssid.decode('ascii'), candidate.signal)
         wlan.connect(interface, candidate)
@@ -190,4 +159,49 @@ def ensure_campus_wifi(stopped, online=None):
         return not stopped()
     finally:
         if wlan:
+            wlan.close()
+
+
+class WinWifi:
+    """WifiBackend for the shared monitor loop.
+
+    ``ensure`` keeps the multi-adapter selection above. The three primitives
+    exist for one-shot queries; ``scan`` reports the Windows
+    cache because a fresh scan needs a wait the protocol has no room for.
+    """
+
+    def ensure(self, stopped):
+        return ensure_campus_wifi(stopped)
+
+    def current(self):
+        wlan = Wlan()
+        try:
+            for interface in wlan.interfaces():
+                ssid = wlan.current(interface)
+                if ssid is not None:
+                    return ssid
+            return None
+        finally:
+            wlan.close()
+
+    def scan(self):
+        wlan = Wlan()
+        try:
+            found = []
+            for interface in wlan.interfaces():
+                found.extend(wlan.networks(interface))
+            return found
+        finally:
+            wlan.close()
+
+    def connect(self, candidate):
+        wlan = Wlan()
+        try:
+            for interface in wlan.interfaces():
+                for network in wlan.networks(interface):
+                    if network.ssid == candidate.ssid and network.profile:
+                        wlan.connect(interface, network)
+                        return True
+            return False
+        finally:
             wlan.close()

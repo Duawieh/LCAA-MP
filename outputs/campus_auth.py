@@ -1,384 +1,260 @@
-"""Windows campus authentication monitor. Never log browser exceptions or credentials."""
+"""Cross-platform command line for the campus network auto authenticator.
+
+Everything OS-specific lives behind ``platforms.<os>``; this file only routes
+commands. It works with Python 3.8 on Windows 7 and later, macOS and Linux, and
+never needs a browser to sign in. Never log browser exceptions or credentials.
+"""
 from __future__ import annotations
-import concurrent.futures
-import ctypes
-import logging
-from logging.handlers import RotatingFileHandler
+import getpass
 import os
-from pathlib import Path
-import subprocess
+import platform
 import sys
-import threading
 import time
-import urllib.request
-import urllib.parse
-import winreg
-import win32api
-import win32con
-import win32cred
-import win32event
-import win32security
-from campus_process import run_bounded
-from playwright.sync_api import sync_playwright
-from campus_wifi import ensure_campus_wifi, campus_wifi_connected
+from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-TARGET = 'CampusAutoAuth/10.10.0.166/eLearning/v1'
-PORTAL = 'http://10.10.0.166/'
-RUN_NAME = 'CampusAutoAuth-eLearning'
-RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
-INTERVAL = 15
-PROBES = (
-    ('https://www.msftconnecttest.com/connecttest.txt', 200, b'Microsoft Connect Test'),
-    ('https://connectivitycheck.platform.hicloud.com/generate_204', 204, b''),
-    ('https://cp.cloudflare.com/generate_204', 204, b''),
-)
-log = logging.getLogger('campus')
+import campus_core as core
+import platforms
+import portal_http
+from setup_ui import run_setup
 
-def object_name(suffix):
-    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+SCRIPT = Path(__file__).resolve()
+RUN_ARGV = [str(SCRIPT), 'run']
+# How long `start` waits for the child to take the lock before calling it a
+# failure. A broken install should surface here, not fifteen minutes later.
+START_TIMEOUT = 6
+USAGE = """用法: campus_auth.py <命令>
+
+  setup             录入或更新凭据，并启动后台监控
+  start             后台启动监控
+  status            查看监控状态
+  stop              停止监控（等待当前操作结束，最多 90 秒）
+  check             立即检测互联网连通性
+  auth [账号]       立即尝试一次认证（已联网时不做任何事）
+  login-http [账号] 只走 HTTP 认证，用于排查门户协议
+  logs              打印日志目录
+  run               前台运行监控（供系统服务调用）
+  install-startup   设置当前用户登录后自启动
+  remove-startup    取消自启动
+  uninstall         停止监控、取消自启动并删除本工具保存的凭据
+"""
+
+
+def build_authenticator(backends, config):
+    return core.Authenticator(
+        backends.credentials,
+        mode=config['auth_mode'],
+        portal=config['portal'],
+        browser_factory=backends.browser,
+    )
+
+
+def monitor(backends, config):
+    core.configure_logging()
+    if not backends.lock.acquire():
+        core.log.info('ALREADY_RUNNING')
+        return 0
+    stop = backends.stop
+    login = build_authenticator(backends, config)
     try:
-        sid = win32security.ConvertSidToStringSid(win32security.GetTokenInformation(token, win32security.TokenUser)[0])
-    finally:
-        token.Close()
-    return 'Global\\CampusAutoAuth-' + sid + '-' + suffix
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-def probe(spec):
-    url, status, body = spec
-    try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        request = urllib.request.Request(url, headers={'Cache-Control': 'no-cache', 'User-Agent': 'CampusAutoAuth/1.0'})
-        with opener.open(request, timeout=4) as response:
-            return response.status == status and response.read(512).strip() == body
-    except Exception:
-        return False
-
-def _probe_round():
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(PROBES))
-    futures = [pool.submit(probe, spec) for spec in PROBES]
-    try:
-        for future in concurrent.futures.as_completed(futures, timeout=5):
-            if future.result():
-                return True
-        return False
-    except concurrent.futures.TimeoutError:
-        return False
-    finally:
-        # _check exits immediately with os._exit; its Job Object cleans up a
-        # resolver that is still stuck. A healthy provider must win immediately.
-        pool.shutdown(wait=False, cancel_futures=True)
-
-def internet_ok():
-    # socket timeouts do not bound DNS resolution on Windows.
-    return run_bounded([sys.executable, Path(__file__).resolve(), '_check'], 7, cwd=ROOT) == 0
-
-def read_credentials():
-    try:
-        entry = win32cred.CredRead(TARGET, win32cred.CRED_TYPE_GENERIC)
-    except win32cred.error as exc:
-        if exc.winerror == 1168:
-            return None
-        raise
-    blob = entry['CredentialBlob']
-    password = blob.decode('utf-16-le') if isinstance(blob, bytes) else blob
-    return entry['UserName'], password
-
-def configure_logging(name='monitor'):
-    folder = ROOT / 'logs'
-    folder.mkdir(exist_ok=True)
-    handler = RotatingFileHandler(folder / (name + '.log'), maxBytes=1024*1024, backupCount=5, encoding='utf-8')
-    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-    log.setLevel(logging.INFO)
-    log.addHandler(handler)
-
-def prepare_form(page):
-    # Selectors confirmed from the live SRun portal, 2026-11-12.
-    log.info('FORM_STAGE navigate')
-    page.goto(PORTAL, wait_until='domcontentloaded', timeout=20000)
-    log.info('FORM_STAGE wait_account_tab')
-    page.locator('.tab-item[data="account"]').wait_for(state='visible', timeout=12000)
-    page.locator('.tab-item[data="account"]').click()
-    log.info('FORM_STAGE select_domain')
-    page.locator('#username').wait_for(state='visible', timeout=10000)
-    # The actual login handler reads this select. Its decorative menu is only
-    # initialized on window.load and can miss clicks before slow assets finish.
-    page.locator('select.domain').select_option(value='@study', force=True, timeout=10000)
-    if page.locator('select.domain').input_value() != '@study':
-        raise RuntimeError('domain_mismatch')
-    if page.locator('#captcha').is_visible():
-        return False
-    if page.locator('#remember').is_checked():
-        page.locator('label[for="remember"]').click()
-    if page.locator('label[for="protocol"]').is_visible() and not page.locator('#protocol').is_checked():
-        page.locator('label[for="protocol"]').click()
-    log.info('FORM_STAGE ready')
-    return True
-
-def submit_form(page, username, password):
-    log.info('LOGIN_STAGE fill_form')
-    page.locator('#username').fill(username)
-    page.locator('#password').fill(password)
-    log.info('LOGIN_STAGE submit')
-    page.locator('#login-account').click(timeout=10000)
-
-def login_once(stopped):
-    result = run_bounded([sys.executable, Path(__file__).resolve(), '_login'], 75, stopped, ROOT)
-    if result is None:
-        log.warning('LOGIN_CANCELLED' if stopped() else 'LOGIN_DEADLINE_EXCEEDED')
-    return result == 0
-
-
-def _login_in_process(stopped):
-    try:
-        return _login_once(stopped)
-    except Exception as exc:
-        # Only a fixed category, never the exception message, URL or fill value.
-        from playwright.sync_api import TimeoutError as BrowserTimeout
-        category = 'browser_timeout' if isinstance(exc, BrowserTimeout) else 'operation_failed'
-        log.warning('LOGIN_ERROR category=%s', category)
-        return False
-
-def _login_once(stopped):
-    log.info('LOGIN_STAGE credentials')
-    credentials = read_credentials()
-    if not credentials:
-        log.warning('CREDENTIALS_MISSING: run setup')
-        return False
-    playwright = sync_playwright().start()
-    log.info('LOGIN_STAGE edge_launch')
-    browser = playwright.chromium.launch(channel='msedge', headless=True)
-    try:
-        context = browser.new_context(service_workers='block')
-        # Never forward credentials to another host; no saved profile, trace or screenshots.
-        context.route('**/*', lambda route: route.continue_() if urllib.parse.urlparse(route.request.url).hostname == '10.10.0.166' else route.abort())
-        page = context.new_page()
-        page.set_default_timeout(10000)
-        log.info('LOGIN_STAGE portal_form')
-        if not prepare_form(page):
-            log.warning('CAPTCHA_REQUIRED: manual portal login required')
-            return False
-        if stopped():
-            return False
-        submit_form(page, *credentials)
-        log.info('LOGIN_STAGE verify_internet')
-        for _ in range(6):
-            if stopped():
-                return False
-            page.wait_for_timeout(2500)
-            if internet_ok():
-                log.info('LOGIN_VERIFIED')
-                return True
-        log.warning('LOGIN_NOT_VERIFIED')
-        return False
-    finally:
-        credentials = None
-
-class RetryPolicy:
-    def __init__(self):
-        self.misses = 0
-        self.failures = 0
-        self.next_attempt = 0.0
-
-    def observe(self, online, now):
-        self.misses = 0 if online else self.misses + 1
-        if online:
-            self.failures = 0
-            self.next_attempt = 0.0
-        return not online and self.misses >= 2 and now >= self.next_attempt
-
-    def result(self, success, now):
-        self.failures = 0 if success else self.failures + 1
-        delay = 60 if success else min(900, 60 * 2 ** min(self.failures - 1, 4))
-        self.next_attempt = now + delay
-        return delay
-
-def recover_connection(stopped):
-    if stopped():
-        return False
-    if internet_ok():
-        return True
-    if campus_wifi_connected():
-        log.info('RECOVERY_PORTAL_FIRST: campus Wi-Fi already connected')
-        if login_once(stopped):
-            return True
-        if stopped():
-            return False
-        # One authentication submission per recovery attempt. Reconnect as fallback,
-        # then let the normal backoff schedule another authentication if necessary.
-        log.info('RECOVERY_WIFI_FALLBACK')
-        if not ensure_campus_wifi(stopped, online=internet_ok) or stopped():
-            return False
-        return internet_ok()
-    if not ensure_campus_wifi(stopped, online=internet_ok) or stopped():
-        return False
-    if internet_ok():
-        return True
-    return login_once(stopped)
-
-def monitor():
-    configure_logging()
-    mutex = win32event.CreateMutex(None, False, object_name('monitor'))
-    if win32api.GetLastError() == 183:
-        log.info('ALREADY_RUNNING')
-        mutex.Close()
-        return
-    event = win32event.CreateEvent(None, True, False, object_name('stop'))
-    win32event.ResetEvent(event)
-    stopped = lambda: win32event.WaitForSingleObject(event, 0) == win32event.WAIT_OBJECT_0
-    policy = RetryPolicy()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    pending = None
-    previous = None
-    log.info('MONITOR_STARTED version=2 interval=15s bounded_workers=enabled')
-    try:
-        while not stopped():
-            tick = time.monotonic()
-            online = internet_ok()
-            if online != previous:
-                log.info('INTERNET_%s', 'ONLINE' if online else 'UNREACHABLE')
-                previous = online
-            if pending is not None and pending.done():
-                try:
-                    success = pending.result()
-                except Exception:
-                    # Playwright error strings can contain fill values. Never emit them.
-                    success = False
-                    log.warning('LOGIN_ERROR: browser or portal unavailable; details suppressed')
-                delay = policy.result(success, time.monotonic())
-                log.info('RECOVERY_%s retry_after=%ss', 'VERIFIED' if success else 'FAILED', delay)
-                pending = None
-            ready = policy.observe(online, time.monotonic())
-            if ready and pending is None and not stopped():
-                log.info('RECOVERY_ATTEMPT')
-                pending = executor.submit(recover_connection, stopped)
-            remaining = max(0.1, INTERVAL - (time.monotonic() - tick))
-            win32event.WaitForSingleObject(event, int(remaining * 1000))
-    except KeyboardInterrupt:
-        win32event.SetEvent(event)
-    finally:
-        win32event.SetEvent(event)
-        executor.shutdown(wait=True)
-        event.Close()
-        mutex.Close()
-        log.info('MONITOR_STOPPED')
-
-def running():
-    try:
-        handle = win32event.OpenMutex(win32con.SYNCHRONIZE, False, object_name('monitor'))
-        handle.Close()
-        return True
-    except win32event.error as exc:
-        if exc.winerror == 2:
-            return False
-        raise
-
-def stop():
-    if not running():
-        return
-    event = win32event.OpenEvent(win32event.EVENT_MODIFY_STATE, False, object_name('stop'))
-    win32event.SetEvent(event)
-    event.Close()
-    for _ in range(90):
-        if not running():
-            return
-        time.sleep(1)
-    raise RuntimeError('stop_timeout')
-
-def start():
-    if running():
-        return
-    pythonw = Path(sys.executable).with_name('pythonw.exe')
-    subprocess.Popen([str(pythonw), str(Path(__file__).resolve()), 'run'], cwd=ROOT,
-                     creationflags=subprocess.CREATE_NO_WINDOW, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     env={k:v for k,v in os.environ.items() if k not in ('DEBUG','PWDEBUG')})
-
-def startup(install):
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-        if install:
-            command = subprocess.list2cmdline([str(Path(sys.executable).with_name('pythonw.exe')), str(Path(__file__).resolve()), 'run'])
-            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, command)
-        else:
+        stop.install_handlers()
+        core.log.info('MONITOR_STARTED platform=%s auth_mode=%s interval=%ss pid=%d python=%s',
+                      backends.name, config['auth_mode'], config['interval'],
+                      os.getpid(), platform.python_version())
+        # An unattended daemon that exits on one bad cycle is worse than one that
+        # logs and retries: nobody is watching to restart it.
+        while not stop.stopped():
             try:
-                winreg.DeleteValue(key, RUN_NAME)
-            except FileNotFoundError:
-                pass
+                core.monitor_loop(
+                    stop.stopped,
+                    stop.wait,
+                    backends.wifi.ensure,
+                    login,
+                    stop.request,
+                    interval=config['interval'],
+                    heartbeat=lambda state: core.record_state(**state),
+                )
+            except Exception:
+                core.log.warning('MONITOR_RESTART: loop failed, retrying in 30s')
+                stop.wait(30)
+    finally:
+        stop.request()
+        stop.close()
+        # Log before releasing the lock: `stop` treats a free lock as "the
+        # monitor is gone", so the final line is on disk by the time it returns.
+        core.log.info('MONITOR_STOPPED')
+        backends.lock.release()
+    return 0
 
-def setup():
-    import tkinter as tk
-    from tkinter import messagebox
-    window = tk.Tk()
-    window.title('校园网 eLearning 凭据设置')
-    window.resizable(False, False)
-    tk.Label(window, text='凭据仅存入本机 Windows Credential Manager。\n账号无需添加 @study；密码不会写入日志。', padx=25, pady=15).grid(row=0,columnspan=2)
-    tk.Label(window,text='账号').grid(row=1,column=0)
-    username = tk.Entry(window, width=32)
-    username.grid(row=1,column=1,padx=15,pady=8)
-    tk.Label(window,text='密码').grid(row=2,column=0)
-    password = tk.Entry(window, show='●', width=32)
-    password.grid(row=2,column=1,padx=15,pady=8)
-    def save():
-        user, secret = username.get().strip(), password.get()
-        if not user or not secret:
-            messagebox.showerror('未保存','请输入账号和密码。')
-            return
-        if user.endswith('@study'):
-            user = user[:-6]
+
+def start(backends):
+    """Launch the monitor and wait until it holds the lock.
+
+    Returns 'already', 'started' or 'failed'. Reporting success before the child
+    is actually up hides a broken install until the next outage.
+    """
+    if platforms.running():
+        return 'already'
+    backends.spawn(RUN_ARGV)
+    deadline = time.monotonic() + START_TIMEOUT
+    while time.monotonic() < deadline:
+        if platforms.running():
+            return 'started'
+        time.sleep(0.2)
+    return 'failed'
+
+
+def describe_state(state):
+    if not state.get('checked'):
+        return ', no heartbeat yet'
+    age = max(0, int(time.time() - state['checked']))
+    return ', last check %ds ago, %s, %d failures' % (
+        age, 'online' if state.get('online') else 'offline', state.get('failures', 0))
+
+
+def http_only(backends, config, account):
+    """Diagnostic path: one HTTP login, no browser, explicit account allowed."""
+    stored = None
+    try:
+        stored = backends.credentials.read()
+    except Exception:
+        stored = None
+    if not account:
+        if not stored:
+            print('CREDENTIALS_MISSING: 请先运行 setup。', file=sys.stderr)
+            return 1
+        account = stored[0]
+    secret = None
+    if stored and stored[0].split('@')[0] == account.split('@')[0]:
+        secret = stored[1]
+        print('使用本机已保存的凭据。')
+    if not secret:
+        if not sys.stdin or not sys.stdin.isatty():
+            print('需要在交互式终端中运行，或先完成 setup。', file=sys.stderr)
+            return 1
+        secret = getpass.getpass('密码: ')
+    result = portal_http.login(account, secret, portal=config['portal'])
+    secret = None
+    if result.success:
+        print('HTTP 登录成功。')
+        return 0
+    print('HTTP 登录失败：' + result.reason)
+    return 1
+
+
+def authenticate(backends, config, account=None):
+    core.configure_logging()
+    if account:
+        # Diagnostic path: attempt regardless of the current state, so the
+        # portal protocol can be checked even while a session is online.
+        return http_only(backends, config, account)
+    if core.internet_ok():
+        print('Already online; nothing to do.')
+        return 0
+    ok = build_authenticator(backends, config)(lambda: False)
+    print('Authenticated.' if ok else 'Authentication failed; see the log.')
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    # Disable Playwright verbose output even when inherited from a dev shell.
+    os.environ.pop('DEBUG', None)
+    os.environ.pop('PWDEBUG', None)
+    command = argv[0] if argv else 'status'
+    if command in ('help', '-h', '--help'):
+        print(USAGE)
+        return 0
+    if command == 'check':
+        print('Online' if core.internet_ok() else 'All probes failed')
+        return 0
+    if command == 'logs':
+        print(core.configure_logging())
+        return 0
+    config = core.load_config()
+    try:
+        backends = platforms.load(SCRIPT)
+    except ImportError as exc:
+        print('缺少平台依赖: %s' % exc, file=sys.stderr)
+        print('请先按 README 安装本平台的依赖。', file=sys.stderr)
+        return 2
+    except RuntimeError:
+        print('当前系统暂不支持: %s' % sys.platform, file=sys.stderr)
+        return 2
+
+    if command == 'setup':
+        run_setup(backends.credentials, lambda: start(backends) != 'failed')
+        return 0
+    if command == 'run':
+        return monitor(backends, config)
+    if command == 'start':
+        outcome = start(backends)
+        if outcome == 'already':
+            print('Already running.')
+            return 0
+        if outcome == 'started':
+            print('Started.')
+            return 0
+        print('Start failed: the monitor did not take the lock; see the log.',
+              file=sys.stderr)
+        return 1
+    if command == 'stop':
+        if platforms.stop_running():
+            print('Stopped.')
+            return 0
+        print('Stop timed out; the monitor is still running.', file=sys.stderr)
+        return 1
+    if command == 'status':
+        # Exit code follows systemctl: 0 running, 1 stopped, so a cron job or a
+        # health check can rely on it without parsing text.
+        if not platforms.running():
+            print('Stopped')
+            return 1
+        print('Running (%s, auth_mode=%s)%s'
+              % (backends.name, config['auth_mode'], describe_state(core.read_state())))
+        return 0
+    if command in ('auth', 'login-http'):
+        # 带账号时只走 HTTP，用于排查门户协议；不带时按 auth_mode 走完整链路。
+        account = argv[1] if len(argv) > 1 else None
+        return authenticate(backends, config, account)
+    if command == 'install-startup':
         try:
-            win32cred.CredWrite({'Type':win32cred.CRED_TYPE_GENERIC,'TargetName':TARGET,
-                                'UserName':user,'CredentialBlob':secret,
-                                'Persist':win32cred.CRED_PERSIST_LOCAL_MACHINE},0)
-        except Exception:
-            messagebox.showerror('保存失败','无法写入 Windows 凭据管理器。')
-            return
-        password.delete(0,tk.END)
-        username.delete(0,tk.END)
-        secret = None
-        start()
-        messagebox.showinfo('已保存','凭据已保存，后台监控已启动。')
-        window.destroy()
-    tk.Button(window,text='保存凭据并启动',command=save).grid(row=3,columnspan=2,pady=18)
-    username.focus_set()
-    window.mainloop()
+            backends.autostart.install(RUN_ARGV)
+        except (OSError, ValueError) as exc:
+            # The message is a fixed identifier such as `systemd_enable_failed`;
+            # the platform code never puts a path or a credential in it.
+            print('Startup install failed: %s' % exc, file=sys.stderr)
+            return 1
+        print('Startup installed for the current user.')
+        return 0
+    if command == 'remove-startup':
+        try:
+            backends.autostart.remove()
+        except (OSError, ValueError) as exc:
+            print('Startup removal failed: %s' % exc, file=sys.stderr)
+            return 1
+        print('Startup removed.')
+        return 0
+    if command == 'uninstall':
+        if not platforms.stop_running():
+            # Removing credentials under a live monitor would leave it failing
+            # with CREDENTIALS_MISSING and no way to tell why.
+            print('Stop timed out; nothing was removed.', file=sys.stderr)
+            return 1
+        backends.autostart.remove()
+        backends.credentials.delete()
+        print('Stopped; startup entry and this tool credential removed. Project files retained.')
+        return 0
+    print(USAGE, file=sys.stderr)
+    return 2
 
-def main():
-    # Disable Playwright verbose output even when inherited from a developer shell.
-    os.environ.pop('DEBUG',None)
-    os.environ.pop('PWDEBUG',None)
-    command = sys.argv[1] if len(sys.argv)>1 else 'status'
-    if command == 'setup': setup()
-    elif command == '_check': os._exit(0 if _probe_round() else 2)
-    elif command == '_login':
-        configure_logging('authentication')
-        result = _login_in_process(lambda: False)
-        for handler in log.handlers:
-            handler.flush()
-        # The parent Job Object owns Edge/driver cleanup; Playwright.close may hang.
-        os._exit(0 if result else 2)
-    elif command == 'run': monitor()
-    elif command == 'start': start(); print('Background start requested.')
-    elif command == 'stop': stop(); print('Stopped.')
-    elif command == 'status': print('Running' if running() else 'Stopped')
-    elif command == 'check': print('Online' if internet_ok() else 'All probes failed')
-    elif command == 'install-startup': startup(True); print('Startup installed for current Windows user.')
-    elif command == 'remove-startup': startup(False); print('Startup removed.')
-    elif command == 'uninstall':
-        stop()
-        startup(False)
-        try: win32cred.CredDelete(TARGET, win32cred.CRED_TYPE_GENERIC)
-        except win32cred.error as exc:
-            if exc.winerror != 1168: raise
-        print('Stopped; startup and this tool credential removed. Project files retained.')
-    else: raise ValueError('unknown_command')
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
     except Exception:
         # Suppress sensitive exception values in every mode.
-        if sys.stderr: print('Operation failed; no sensitive details recorded.', file=sys.stderr)
+        if sys.stderr:
+            print('Operation failed; no sensitive details recorded.', file=sys.stderr)
         sys.exit(1)
