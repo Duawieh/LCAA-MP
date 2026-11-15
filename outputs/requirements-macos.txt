@@ -1,0 +1,4 @@
+# Optional: Wi-Fi scanning on macOS through CoreWLAN. Without it the tool still
+# connects, it just cannot pick the stronger of iLZU / LZU.
+-r requirements.txt
+pyobjc-framework-CoreWLAN>=10
