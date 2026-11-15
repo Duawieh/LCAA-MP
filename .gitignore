@@ -4,6 +4,7 @@ venv/
 __pycache__/
 logs/
 work/
+docs/
 
 *.py[cod]
 *.log
