@@ -1,0 +1,4 @@
+# Optional: only needed when the portal demands a captcha and a browser must
+# finish the login. The HTTP path works without this file.
+-r requirements.txt
+playwright>=1.40

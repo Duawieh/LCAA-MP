@@ -1,0 +1,15 @@
+.workbuddy-ai/
+.venv/
+venv/
+__pycache__/
+logs/
+work/
+
+*.py[cod]
+*.log
+*.log.*
+.env
+.env.*
+*.har
+
+config.json
